@@ -6,54 +6,24 @@ import {
   NO_EXPIRATION,
   SchemaRegistry
 } from "@ethereum-attestation-service/eas-sdk";
-import { TransitiveTrustGraph } from "@ethereum-attestation-service/transitive-trust-sdk";
-import { ethers, AbiCoder, getBytes } from "ethers";
-import GetAttestations from './transitiveTrust';
 import { createZGServingNetworkBroker } from "@0glabs/0g-serving-broker";
-// import { WalletInteraction } from './mcpWallet'; 
-// import { WalletCall } from './mcpWallet';
-
+import { ethers } from "ethers";
 
 export const EASContractAddress = "0x4200000000000000000000000000000000000021"; // Base Sepolia v0.26
 const schemaRegistryContractAddress =
   "0x4200000000000000000000000000000000000020";
 const schemaUID = import.meta.env.VITE_EAS_SCHEMA_ID;
 
-const api = new OpenAI({
-  apiKey: import.meta.env.VITE_OPEN_AI_KEY,
-  baseURL: 'https://models.inference.ai.azure.com',
-  dangerouslyAllowBrowser: true,
-});
-
-export const fetchSchemaRecord = async (provider: any, attestation_data: any) => {
-  const schemaRegistry = new SchemaRegistry(schemaRegistryContractAddress);
-  await schemaRegistry.connect(provider);
-
-  const schemaRecord = await schemaRegistry.getSchema({ uid: attestation_data });
-  console.log(schemaRecord);
-  return schemaRecord[3]
-};
-
-function parseSchema(schemaRecord: any) {
-  const parts = schemaRecord.split(",").map((part: any) => part.trim());
-  const abiTypes = parts.map((part: any) => {
-    const [type, name] = part.split(" ").map((p: any) => p.trim());
-    return { type, name };
-  });
-  console.log("abi", abiTypes);
-  return abiTypes;
-}
-
 // Function to calculate the player's reputation score
 export async function calculateReputationScore(games: GameTimePlayed[]): Promise<number> {
-
   try {
-
     const provider = new ethers.JsonRpcProvider("https://evmrpc-testnet.0g.ai");
-    const signer = await provider.getSigner();
-    const broker = await createZGServingNetworkBroker(signer);
+    const ADMIN_PRIVATE_KEY = process.env.NEXT_PUBLIC_ADMIN_PRIVATE_KEY_ZG!;
+    const adminWallet = new ethers.Wallet(ADMIN_PRIVATE_KEY, provider);
 
-    // Step 3: List available services
+    const broker = await createZGServingNetworkBroker(adminWallet);
+
+    // List available services
     console.log("Listing available services...");
     const services = await broker.listService();
     services.forEach((service: any) => {
@@ -62,125 +32,70 @@ export async function calculateReputationScore(games: GameTimePlayed[]): Promise
       );
     });
 
-    // Step 3.1: Select a service
-    const service = services.find(
-      (service: any) => service.name === "Please input the service name"
-    );
+    // Select the desired service
+    const serviceName = "YourServiceName"; // Replace with the actual service name
+    const service = services.find((s: any) => s.name === serviceName);
     if (!service) {
       console.error("Service not found.");
-      return;
+      return 0;
     }
+
     const providerAddress = service.provider;
 
-
-    // Step 4: Manage Accounts
+    // Fund the account for using the service
     const initialBalance = 0.00000001;
-    // Step 4.1: Create a new account
-    console.log("Creating a new account...");
     await broker.addAccount(providerAddress, initialBalance);
-    console.log("Account created successfully.");
 
-    // Step 4.2: Deposit funds into the account
     const depositAmount = 0.00000002;
     console.log("Depositing funds...");
     await broker.depositFund(providerAddress, depositAmount);
     console.log("Funds deposited successfully.");
 
-    // Step 4.3: Get the account
-    const account = await broker.getAccount(providerAddress);
-    console.log(account);
+    // Fetch metadata for the service
+    const { endpoint, model } = await broker.getServiceMetadata(providerAddress, serviceName);
 
-    // Step 5: Use the Provider's Services
-    console.log("Processing a request...");
-    const serviceName = service.name;
-    const content = "Please input your message here";
+    // Prepare request headers
+    const content = `Analyze these game statistics and provide the player's reputation score as a single two-digit number: ${JSON.stringify(games)}`;
+    const headers = await broker.getRequestHeaders(providerAddress, serviceName, content);
 
-    // Step 5.1: Get the request metadata
-    const { endpoint, model } = await broker.getServiceMetadata(
-      providerAddress,
-      serviceName
-    );
-
-    // Step 5.2: Get the request headers
-    const headers = await broker.getRequestHeaders(
-      providerAddress,
-      serviceName,
-      content
-    );
-
-    // Step 6: Send a request to the service
-    const openai = new OpenAI({
-      baseURL: endpoint,
-      apiKey: "",
-    });
-    const completion = await openai.chat.completions.create(
-      {
+    // Send the request using the fetched metadata and headers
+    const response = await fetch(`${endpoint}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...headers,
+      },
+      body: JSON.stringify({
         messages: [{ role: "system", content }],
         model: model,
-      },
-      {
-        headers: {
-          ...headers,
-        },
-      }
-    );
+      }),
+    });
 
-    const receivedContent = completion.choices[0].message.content;
-    const chatID = completion.id;
-    if (!receivedContent) {
-      throw new Error("No content received.");
+    if (!response.ok) {
+      console.error("Error in AI service request:", response.statusText);
+      return 0;
     }
-    console.log("Response:", receivedContent);
 
-    // Step 7: Process the response
-    console.log("Processing a response...");
-    const isValid = await broker.processResponse(
-      providerAddress,
-      serviceName,
-      receivedContent,
-      chatID
-    );
+    const result = await response.json();
+    const receivedContent = result.choices?.[0]?.message?.content || '';
+    console.log("Response Content:", receivedContent);
+
+    // Process the response
+    const chatID = result.id;
+    const isValid = await broker.processResponse(providerAddress, serviceName, receivedContent, chatID);
     console.log(`Response validity: ${isValid ? "Valid" : "Invalid"}`);
-  } catch (error) {
-    console.error("Error during execution:", error);
-  }
 
-  if (!Array.isArray(games) || games.length === 0) {
-    console.warn('No games provided, returning default score.');
+    const scoreMatch = receivedContent.match(/\b\d{1,3}\b/);
+    const score = scoreMatch ? parseInt(scoreMatch[0], 10) : 0;
+    return Math.min(Math.max(score, 0), 100);
+
+  } catch (error) {
+    console.error("Error calculating reputation score:", error);
     return 0;
   }
-
-  const gamesData = games.map(game => ({
-    name: game.name || 'Unknown',
-    timePlayed: game.timePlayed || 0,
-  }));
-
-  const completion = await api.chat.completions.create({
-    model: 'gpt-4o',
-    messages: [
-      {
-        role: 'system',
-        content: 'You are a gaming reputation analyzer. Based on the player\'s game statistics, calculate their reputation score fairly, considering factors like time played, calculate all the time played (cumulative of all games) and number of games played. Calculate soes the data looks like it is from a human, give more score if data looks human, if data looks like generated by a bot then give less points. Output only the reputation score as a two-digit number (0-100), without any explanation or additional text.'
-      },
-      {
-        role: 'user',
-        content: `Analyze these game statistics and provide the player's reputation score as a single two-digit number: ${JSON.stringify(gamesData)}`
-      }
-    ],
-    temperature: 0.7,
-    max_tokens: 5,
-  });
-
-  const responseContent = completion.choices?.[0]?.message?.content || '';
-  const scoreMatch = responseContent.match(/\b\d{1,3}\b/);
-  const score = scoreMatch ? parseInt(scoreMatch[0], 10) : 0;
-
-  return Math.min(Math.max(score, 0), 100);
-} catch (error: any) {
-  console.error('Error calculating reputation score:', error.message || error);
-  return 0;
 }
-}
+
+
 
 // Function to attest data with EAS
 export async function attestData(score: number) {
